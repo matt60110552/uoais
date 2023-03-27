@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import rospy
 import os
@@ -8,6 +8,10 @@ import message_filters
 import cv_bridge
 from pathlib import Path
 import open3d as o3d
+import tf2_ros
+from tf.transformations import quaternion_matrix
+import cv2
+import time
 
 from utils import *
 from adet.config import get_cfg
@@ -50,6 +54,16 @@ class UOAIS():
         
         # initialize UOAIS-Net and CG-Net
         self.load_models()
+        """
+        add by matt, do some tf2 work to transform frame
+        """
+        self.tf_buffer = tf2_ros.Buffer()
+        self.listener = tf2_ros.TransformListener(self.tf_buffer)  # Create a tf listener
+        self.target_center = None  # x, y and z center of target point cloud
+        self.target_pointcloud = None  # point cloud of target
+        """
+        end of add
+        """
 
         if self.use_planeseg:
             camera_info = rospy.wait_for_message(camera_info_topic, CameraInfo)
@@ -110,7 +124,7 @@ class UOAIS():
         
 
     def inference(self, rgb_msg, depth_msg):
-
+        start_time = time.time()
         rgb_img = self.cv_bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='bgr8')
         ori_H, ori_W, _ = rgb_img.shape
         rgb_img = cv2.resize(rgb_img, (self.W, self.H))
@@ -200,8 +214,8 @@ class UOAIS():
             bbox = RegionOfInterest()
             bbox.x_offset = int(pred_bboxes[i][0])
             bbox.y_offset = int(pred_bboxes[i][1])
-            bbox.width = int(pred_bboxes[i][0]-pred_bboxes[i][2])
-            bbox.height = int(pred_bboxes[i][1]-pred_bboxes[i][3])
+            bbox.width = int(pred_bboxes[i][2]-pred_bboxes[i][0])
+            bbox.height = int(pred_bboxes[i][3]-pred_bboxes[i][1])
             results.bboxes.append(bbox)
             results.visible_masks.append(self.cv_bridge.cv2_to_imgmsg(
                                         np.uint8(pred_visibles[i]), encoding="mono8"))
@@ -210,6 +224,77 @@ class UOAIS():
         results.occlusions = pred_occs.tolist()
         results.class_names = ["object"] * n_instances
         results.class_ids = [0] * n_instances
+
+        """
+        Extra part add by Matt, take depth image and mask as input to generate masked depth image
+        and then turn it into pointcloud
+        """
+        pointcloud_list = []
+        dis_list = []
+        self.o3d_camera_intrinsic = o3d.camera.PinholeCameraIntrinsic(
+                                        640, 480,
+                                        617.0441284179688*640/ori_W,
+                                        617.0698852539062*480/ori_H,
+                                        322.3338317871094, 238.7687225341797)
+        try:
+            """
+            convert camera_color_optical_frame to camer_link
+            """
+            transform_stamped = self.tf_buffer.lookup_transform('base_link', depth_msg.header.frame_id, rospy.Time(0))
+            trans = np.array([transform_stamped.transform.translation.x,
+                              transform_stamped.transform.translation.y,
+                              transform_stamped.transform.translation.z])
+            quat = np.array([transform_stamped.transform.rotation.x,
+                            transform_stamped.transform.rotation.y,
+                            transform_stamped.transform.rotation.z,
+                            transform_stamped.transform.rotation.w])
+            T = quaternion_matrix(quat)
+            T[:3, 3] = trans
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            rospy.logerr("Failed to transform point cloud: {}".format(e))
+            return
+
+        coord_frame_mesh = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5, origin=[0, 0, 0])
+
+        for i in range(n_instances):
+            mask = np.array(pred_visibles[i]).astype(int)
+            un_depth_img = unnormalize_depth(depth_img)
+            un_depth_img[np.logical_not(mask)] = 0
+            kernel = np.ones((3, 3), np.uint8)
+            un_depth_img = cv2.erode(un_depth_img, kernel, iterations=1)
+            o3d_rgb_img = o3d.geometry.Image(rgb_img)
+            o3d_depth_img = o3d.geometry.Image(un_depth_img)
+            rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(o3d_rgb_img, o3d_depth_img)
+
+            o3d_pc = o3d.geometry.PointCloud.create_from_rgbd_image(
+                                                rgbd_image, self.o3d_camera_intrinsic)
+            sampled_pc = np.asarray(o3d_pc.points)
+            sampled_o3d_pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(sampled_pc))
+            pcd_filtered, _ = sampled_o3d_pc.remove_statistical_outlier(nb_neighbors=40, std_ratio=1.5)
+            pointcloud_list.append(pcd_filtered)
+
+        if self.target_pointcloud is None:
+            dis_list = [np.linalg.norm(x.get_center()) for x in pointcloud_list]  # get distance between point cloud and origina
+            index = np.argmin(dis_list)  # choose the closet one as target
+            self.target_pointcloud = pointcloud_list[index].transform(T)  # convert the target point cloud to world frame
+            self.target_center = self.target_pointcloud.get_center()  # get point center of target point cloud in world frame
+            o3d.visualization.draw_geometries([self.target_pointcloud])
+        else:
+            tran_pc_list = [x.transform(T) for x in pointcloud_list]
+            dis_list = [np.linalg.norm(x.get_center() - self.target_center) for x in tran_pc_list]
+            index = np.argmin(dis_list)
+            closet_pointcloud = tran_pc_list[index]
+            self.target_pointcloud.paint_uniform_color([1, 0, 0])
+            closet_pointcloud.paint_uniform_color([0, 1, 0])
+            pointclouds = [self.target_pointcloud, closet_pointcloud]  # compare the preview pc and current one
+            o3d.visualization.draw_geometries(pointclouds)
+
+        end_time = time.time()
+        print("cost time: {}".format(end_time - start_time))
+
+        """
+        End of add by Matt
+        """
         return results
 
 if __name__ == '__main__':
