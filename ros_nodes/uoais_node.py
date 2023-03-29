@@ -11,6 +11,7 @@ import open3d as o3d
 import tf2_ros
 from tf.transformations import quaternion_matrix
 import cv2
+import matplotlib.pyplot as plt
 import time
 
 from utils import *
@@ -19,6 +20,8 @@ from adet.utils.visualizer import visualize_pred_amoda_occ
 from adet.utils.post_process import detector_postprocess, DefaultPredictor
 from foreground_segmentation.model import Context_Guided_Network
 
+from sensor_msgs.msg import PointCloud2, PointField
+from geometry_msgs.msg import TransformStamped
 from std_msgs.msg import String, Header
 from sensor_msgs.msg import Image, CameraInfo, RegionOfInterest
 from uoais.msg import UOAISResults
@@ -61,6 +64,13 @@ class UOAIS():
         self.listener = tf2_ros.TransformListener(self.tf_buffer)  # Create a tf listener
         self.target_center = None  # x, y and z center of target point cloud
         self.target_pointcloud = None  # point cloud of target
+        self.o3d_camera_intrinsic = o3d.camera.PinholeCameraIntrinsic(
+                                        640, 480,
+                                        617.0441284179688*640/640,
+                                        617.0698852539062*480/480,
+                                        322.3338317871094, 238.7687225341797)
+
+
         """
         end of add
         """
@@ -80,6 +90,7 @@ class UOAIS():
 
         elif self.mode == "service":
             self.srv = rospy.Service('/get_uoais_results', UOAISRequest, self.service_callback)
+            self.points_pub = rospy.Publisher("/uoais/Pointclouds", PointCloud2, queue_size=10)
             rospy.loginfo("uoais results at service: /get_uoais_results")
         else:
             raise NotImplementedError
@@ -132,19 +143,19 @@ class UOAIS():
         depth_img = normalize_depth(depth)
         depth_img = cv2.resize(depth_img, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
         depth_img = inpaint_depth(depth_img)
-
+        print("0 time: {}".format(time.time() - start_time))
         # UOAIS-Net inference
         if self.cfg.INPUT.DEPTH and self.cfg.INPUT.DEPTH_ONLY:
             uoais_input = depth_img
         elif self.cfg.INPUT.DEPTH and not self.cfg.INPUT.DEPTH_ONLY: 
             uoais_input = np.concatenate([rgb_img, depth_img], -1)        
         outputs = self.predictor(uoais_input)
-        instances = detector_postprocess(outputs['instances'], self.H, self.W).to('cpu')
+        instances = detector_postprocess(outputs['instances'], self.H, self.W).to('cuda')
         preds = instances.pred_masks.detach().cpu().numpy() 
         pred_visibles = instances.pred_visible_masks.detach().cpu().numpy() 
         pred_bboxes = instances.pred_boxes.tensor.detach().cpu().numpy() 
-        pred_occs = instances.pred_occlusions.detach().cpu().numpy() 
-
+        pred_occs = instances.pred_occlusions.detach().cpu().numpy()
+        print("1 time: {}".format(time.time() - start_time))
         # filter out the background instances 
         # CG-Net
         if self.use_cgnet:
@@ -196,46 +207,38 @@ class UOAIS():
         idx_shuf = np.concatenate((np.where(pred_occs==1)[0] , np.where(pred_occs==0)[0] )) 
         preds, pred_visibles, pred_occs, pred_bboxes = \
             preds[idx_shuf], pred_visibles[idx_shuf], pred_occs[idx_shuf], pred_bboxes[idx_shuf]
-        vis_img = visualize_pred_amoda_occ(rgb_img, preds, pred_bboxes, pred_occs)
-        if self.use_cgnet or self.use_planeseg:
-            vis_fg = np.zeros_like(rgb_img) 
-            vis_fg[:, :, 1] = fg_output * 255
-            vis_img = cv2.addWeighted(vis_img, 0.8, vis_fg, 0.2, 0)
-        self.vis_pub.publish(self.cv_bridge.cv2_to_imgmsg(vis_img, encoding="bgr8"))
-
+        # vis_img = visualize_pred_amoda_occ(rgb_img, preds, pred_bboxes, pred_occs)
+        # if self.use_cgnet or self.use_planeseg:
+        #     vis_fg = np.zeros_like(rgb_img) 
+        #     vis_fg[:, :, 1] = fg_output * 255
+        #     vis_img = cv2.addWeighted(vis_img, 0.8, vis_fg, 0.2, 0)
+        # self.vis_pub.publish(self.cv_bridge.cv2_to_imgmsg(vis_img, encoding="bgr8"))
         # pubish the uoais results
         results = UOAISResults()
-        results.header = rgb_msg.header
-        results.bboxes = []
-        results.visible_masks = []
-        results.amodal_masks = []
-        n_instances = len(pred_occs)
-        for i in range(n_instances):
-            bbox = RegionOfInterest()
-            bbox.x_offset = int(pred_bboxes[i][0])
-            bbox.y_offset = int(pred_bboxes[i][1])
-            bbox.width = int(pred_bboxes[i][2]-pred_bboxes[i][0])
-            bbox.height = int(pred_bboxes[i][3]-pred_bboxes[i][1])
-            results.bboxes.append(bbox)
-            results.visible_masks.append(self.cv_bridge.cv2_to_imgmsg(
-                                        np.uint8(pred_visibles[i]), encoding="mono8"))
-            results.amodal_masks.append(self.cv_bridge.cv2_to_imgmsg(
-                                        np.uint8(preds[i]), encoding="mono8"))
-        results.occlusions = pred_occs.tolist()
-        results.class_names = ["object"] * n_instances
-        results.class_ids = [0] * n_instances
-
+        # results.header = rgb_msg.header
+        # results.bboxes = []
+        # results.visible_masks = []
+        # results.amodal_masks = []
+        # n_instances = len(pred_occs)
+        # for i in range(n_instances):
+        #     bbox = RegionOfInterest()
+        #     bbox.x_offset = int(pred_bboxes[i][0])
+        #     bbox.y_offset = int(pred_bboxes[i][1])
+        #     bbox.width = int(pred_bboxes[i][2]-pred_bboxes[i][0])
+        #     bbox.height = int(pred_bboxes[i][3]-pred_bboxes[i][1])
+        #     results.bboxes.append(bbox)
+        #     results.visible_masks.append(self.cv_bridge.cv2_to_imgmsg(
+        #                                 np.uint8(pred_visibles[i]), encoding="mono8"))
+        #     results.amodal_masks.append(self.cv_bridge.cv2_to_imgmsg(
+        #                                 np.uint8(preds[i]), encoding="mono8"))
+        # results.occlusions = pred_occs.tolist()
+        # results.class_names = ["object"] * n_instances
+        # results.class_ids = [0] * n_instances
+        print("2 time: {}".format(time.time() - start_time))
         """
         Extra part add by Matt, take depth image and mask as input to generate masked depth image
         and then turn it into pointcloud
         """
-        pointcloud_list = []
-        dis_list = []
-        self.o3d_camera_intrinsic = o3d.camera.PinholeCameraIntrinsic(
-                                        640, 480,
-                                        617.0441284179688*640/ori_W,
-                                        617.0698852539062*480/ori_H,
-                                        322.3338317871094, 238.7687225341797)
         try:
             """
             convert camera_color_optical_frame to camer_link
@@ -250,52 +253,141 @@ class UOAIS():
                             transform_stamped.transform.rotation.w])
             T = quaternion_matrix(quat)
             T[:3, 3] = trans
+            T_inv = np.linalg.inv(T)
         except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
             rospy.logerr("Failed to transform point cloud: {}".format(e))
             return
 
-        coord_frame_mesh = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5, origin=[0, 0, 0])
 
-        for i in range(n_instances):
-            mask = np.array(pred_visibles[i]).astype(int)
-            un_depth_img = unnormalize_depth(depth_img)
-            un_depth_img[np.logical_not(mask)] = 0
-            kernel = np.ones((3, 3), np.uint8)
-            un_depth_img = cv2.erode(un_depth_img, kernel, iterations=1)
-            o3d_rgb_img = o3d.geometry.Image(rgb_img)
-            o3d_depth_img = o3d.geometry.Image(un_depth_img)
-            rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(o3d_rgb_img, o3d_depth_img)
 
-            o3d_pc = o3d.geometry.PointCloud.create_from_rgbd_image(
-                                                rgbd_image, self.o3d_camera_intrinsic)
-            sampled_pc = np.asarray(o3d_pc.points)
-            sampled_o3d_pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(sampled_pc))
-            pcd_filtered, _ = sampled_o3d_pc.remove_statistical_outlier(nb_neighbors=40, std_ratio=1.5)
-            pointcloud_list.append(pcd_filtered)
+        print("3 time: {}".format(time.time() - start_time))
+
 
         if self.target_pointcloud is None:
-            dis_list = [np.linalg.norm(x.get_center()) for x in pointcloud_list]  # get distance between point cloud and origina
-            index = np.argmin(dis_list)  # choose the closet one as target
-            self.target_pointcloud = pointcloud_list[index].transform(T)  # convert the target point cloud to world frame
-            self.target_center = self.target_pointcloud.get_center()  # get point center of target point cloud in world frame
-            o3d.visualization.draw_geometries([self.target_pointcloud])
+            np.set_printoptions(threshold=np.inf)
+            ave_depth_list = []
+            depth_list = []
+            in_for_time = time.time()
+            for i in range(len(pred_visibles)):
+                mask = np.array(pred_visibles[i]).astype(int)
+                # cv2.imshow('Image', mask.astype(np.uint8)*255)
+                # # Wait for a key press to exit
+                # cv2.waitKey(0)
+                # # Close all windows
+                # cv2.destroyAllWindows()
+
+
+                un_depth_img = unnormalize_depth(depth_img)
+                un_depth_img[np.logical_not(mask)] = 0
+                kernel = np.ones((3, 3), np.uint8)
+                un_depth_img = cv2.erode(un_depth_img, kernel, iterations=1)
+                ave_depth_list.append(np.mean(un_depth_img[un_depth_img != 0]))
+                depth_list.append(un_depth_img)
+            un_depth_img = depth_list[np.argmin(ave_depth_list)]
+
+            print("4 time: {}".format(time.time() - start_time))
         else:
-            tran_pc_list = [x.transform(T) for x in pointcloud_list]
-            dis_list = [np.linalg.norm(x.get_center() - self.target_center) for x in tran_pc_list]
-            index = np.argmin(dis_list)
-            closet_pointcloud = tran_pc_list[index]
+            in_for_time = time.time()
+            """
+            project pointcloud back to plane
+            """
+            previews_pointcloud = o3d.geometry.PointCloud()
+            previews_pointcloud.points = o3d.utility.Vector3dVector(self.target_pointcloud.points)
+            previews_pointcloud.transform(T_inv)
+            target_pointcloud_cam = np.asarray(previews_pointcloud.points).copy()
+            fx = self.o3d_camera_intrinsic.intrinsic_matrix[0, 0]
+            fy = self.o3d_camera_intrinsic.intrinsic_matrix[1, 1]
+            cx = self.o3d_camera_intrinsic.intrinsic_matrix[0, 2]
+            cy = self.o3d_camera_intrinsic.intrinsic_matrix[1, 2]
+            projected_target_pixel = []
+            for i in range(len(target_pointcloud_cam)):
+                u = target_pointcloud_cam[i, 0] * fx / target_pointcloud_cam[i, 2] + cx
+                v = target_pointcloud_cam[i, 1] * fy / target_pointcloud_cam[i, 2] + cy
+                projected_target_pixel.append([u, v])
+            projected_target_pixel = np.asarray(projected_target_pixel)
+            projected_target_pixel = projected_target_pixel.astype(int)
+            projected_target_pixel = np.asarray(projected_target_pixel[:, :2])
+            pixel_set, _ = np.unique(projected_target_pixel, axis=0, return_index=True)
+            # print("pixel_set: {}".format(pixel_set))
+            target_area = np.zeros((480, 640), dtype=int)
+            target_area[pixel_set[:, 1] - 1, pixel_set[:, 0] - 1] = 1  # u and v start with 1
+
+            # # # print("target_area: {}".format(target_area))
+            # cv2.imshow('Image', target_area.astype(np.uint8)*255)
+            # # Wait for a key press to exit
+            # cv2.waitKey(0)
+            # # Close all windows
+            # cv2.destroyAllWindows()
+
+
+            """
+            compare current mask and projected target_mask
+            """
+
+            overlap_list = []
+            for i in range(len(pred_visibles)):
+                mask = np.array(pred_visibles[i]).astype(int)
+                overlap = np.logical_and(mask, target_area)
+                overlap_list.append(np.count_nonzero(overlap))
+
+            final_mask = np.array(pred_visibles[np.argmax(overlap_list)]).astype(int)
+            # final_mask = np.array(pred_visibles[0]).astype(int)  # randomly choose, remember to delete
+            un_depth_img = unnormalize_depth(depth_img)
+            un_depth_img[np.logical_not(final_mask)] = 0
+            kernel = np.ones((3, 3), np.uint8)
+            un_depth_img = cv2.erode(un_depth_img, kernel, iterations=1)
+            print("4 time: {}".format(time.time() - start_time))
+
+        o3d_rgb_img = o3d.geometry.Image(rgb_img)
+        o3d_depth_img = o3d.geometry.Image(un_depth_img)
+        rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(o3d_rgb_img, o3d_depth_img)
+        o3d_pc = o3d.geometry.PointCloud.create_from_rgbd_image(
+                                            rgbd_image, self.o3d_camera_intrinsic)
+
+        sampled_pc, _ = o3d_pc.remove_statistical_outlier(nb_neighbors=20, std_ratio=1.0)
+        if self.target_pointcloud is None:
+            sampled_pc.transform(T)
+            # o3d.visualization.draw_geometries([sampled_pc])
+            pass
+        else:
+            sampled_pc.transform(T)
+            pass
             self.target_pointcloud.paint_uniform_color([1, 0, 0])
-            closet_pointcloud.paint_uniform_color([0, 1, 0])
-            pointclouds = [self.target_pointcloud, closet_pointcloud]  # compare the preview pc and current one
-            o3d.visualization.draw_geometries(pointclouds)
+            sampled_pc.paint_uniform_color([0, 1, 0])
+            o3d.visualization.draw_geometries([self.target_pointcloud, sampled_pc])
+
+        self.target_pointcloud = o3d.geometry.PointCloud()
+        self.target_pointcloud.points = o3d.utility.Vector3dVector(sampled_pc.points)
+
+        # pc = PointCloud2()
+        # pc.header.stamp = rospy.Time().now()
+        # pc.header.frame_id = "project_frame"
+        # pc.fields = [
+        #     PointField('x', 0, PointField.FLOAT32, 1),
+        #     PointField('y', 4, PointField.FLOAT32, 1),
+        #     PointField('z', 8, PointField.FLOAT32, 1)]
+        # pc.height = 1
+        # pc.width = len(np.asarray(self.target_pointcloud.points))
+        # pc.is_bigendian = False
+        # pc.point_step = 12
+        # pc.row_step = pc.point_step * len(np.asarray(self.target_pointcloud.points)) 
+        # pc.is_dense = False
+        # pc.data = np.asarray(self.target_pointcloud.points, np.float32).tostring()
+        # while True:
+        #     self.points_pub.publish(pc)
+
+        """
+        end of test
+        """
 
         end_time = time.time()
-        print("cost time: {}".format(end_time - start_time))
+        print("total time: {}".format(end_time - start_time))
 
         """
         End of add by Matt
         """
         return results
+
 
 if __name__ == '__main__':
 
