@@ -3,7 +3,7 @@
 
 BASH_OPTION=bash
 
-IMG=iscilab/uoais:cuda-20-04
+IMG=iscilab/uoais_ros2:cuda-20-04
 containerid=$(docker ps -qf "ancestor=${IMG}") && echo $containerid
 
 xhost +
@@ -14,8 +14,8 @@ then
         --privileged \
         -e DISPLAY=${DISPLAY} \
         -e LINES="$(tput lines)" \
-        uoais \
+        uoais_ros2 \
         $BASH_OPTION
 else
-    docker start -i uoais
+    docker start -i uoais_ros2
 fi

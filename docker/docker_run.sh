@@ -47,15 +47,15 @@ docker run \
     -e DISPLAY=$DISPLAY \
     -e QT_X11_NO_MITSHM=1 \
     -e XAUTHORITY=$XAUTH \
-    -v "/home/$user/uoais_ws:/home/user/uoais_ws" \
+    -v "/home/$user/uoais_ws_ros2:/home/user/uoais_ws_ros2" \
     -v "$XAUTH:$XAUTH" \
     -v "/tmp/.X11-unix:/tmp/.X11-unix" \
     -v "/etc/localtime:/etc/localtime:ro" \
     --user "root:root" \
-    --name uoais\
+    --name uoais_ros2\
     --network host \
     --privileged \
     --security-opt seccomp=unconfined \
     $DOCKER_OPTS \
-    iscilab/uoais:cuda-20-04 \
+    iscilab/uoais_ros2:cuda-20-04 \
     $BASH_OPTION
